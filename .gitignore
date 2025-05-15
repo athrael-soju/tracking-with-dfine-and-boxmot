@@ -1,0 +1,8 @@
+.ruff_cache
+.gradio
+venv
+static
+clip_market1501.pt
+osnet_x1_0_msmt17.pt
+__pycache__/
+.DS_Store
