@@ -8,6 +8,7 @@ import supervision as sv
 from PIL import Image
 from pathlib import Path # For VIDEO_OUTPUT_DIR
 from typing import Optional, Tuple, List # For type hints
+import csv # Added csv import
 
 from transformers.image_utils import load_image
 
@@ -20,6 +21,8 @@ from tracking import get_tracker, update_tracker
 # For now, keeping them here for simplicity during refactoring
 VIDEO_OUTPUT_DIR = Path(config.VIDEO_OUTPUT_DIR_STR)
 VIDEO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DATASET_OUTPUT_DIR = Path("static/dataset") # Added DATASET_OUTPUT_DIR
+DATASET_OUTPUT_DIR.mkdir(parents=True, exist_ok=True) # Ensure DATASET_OUTPUT_DIR exists
 color = sv.ColorPalette.from_hex(config.COLOR_PALETTE_HEX)
 
 # Logger might also be passed or initialized per module
@@ -58,9 +61,9 @@ def process_image(
     result = results[0]
 
     annotations = []
-    for label, score, box in zip(result["labels"], result["scores"], result["boxes"]):
+    for idx, (label, score, box) in enumerate(zip(result["labels"], result["scores"], result["boxes"])):
         text_label = id2label[label.item()]
-        formatted_label = f"{text_label} ({score:.2f})"
+        formatted_label = f"#{idx} {text_label} ({score:.2f})"
         x_min, y_min, x_max, y_max = box.cpu().numpy().round().astype(int)
         x_min = max(0, x_min)
         y_min = max(0, y_min)
@@ -109,8 +112,8 @@ def process_video(
     classes: str = "all",
     confidence_threshold: float = config.DEFAULT_CONFIDENCE_THRESHOLD,
     video_fps: int = 1,
-    progress: gr.Progress = gr.Progress(track_tqdm=True),
-    # VIDEO_OUTPUT_DIR and color can be passed as args if they are not global or part of config
+    create_dataset: bool = False, # Added create_dataset parameter
+    progress: gr.Progress = gr.Progress(track_tqdm=True)
 ) -> str:
     if not video_path or not os.path.isfile(video_path):
         raise gr.Error(f"Invalid video path: {video_path}. Please upload a valid video file.")
@@ -163,9 +166,12 @@ def process_video(
     )
 
     annotated_frames = []
+    dataset_rows = [] # Initialize dataset_rows
+    
     if tracker_algorithm:
         tracker = get_tracker(tracker_algorithm, actual_processing_fps) # Use actual_processing_fps for tracker
-        for frame, result in progress.tqdm(zip(frames, results), desc="Tracking objects", total=len(frames)):
+        for frame_idx, (frame, result) in enumerate(progress.tqdm(zip(frames, results), desc="Tracking objects", total=len(frames))): # Added frame_idx
+            current_timestamp = frame_idx / actual_processing_fps if actual_processing_fps > 0 else 0.0 # Calculate timestamp
             detections = sv.Detections.from_transformers(result, id2label=id2label)
             detections = detections.with_nms(threshold=0.95, class_agnostic=True)
             detections = update_tracker(tracker, detections, frame)
@@ -175,12 +181,21 @@ def process_video(
                     f"#{tracker_id} {id2label[class_id]} ({confidence:.2f})"
                     for class_id, tracker_id, confidence in zip(detections.class_id, detections.tracker_id, detections.confidence)
                 ]
+                if create_dataset:
+                    for box, class_id_tensor, tracker_id_tensor, confidence_tensor in zip(detections.xyxy, detections.class_id, detections.tracker_id, detections.confidence):
+                        class_name = id2label[class_id_tensor.item()]
+                        x_min, y_min, x_max, y_max = box.tolist()
+                        dataset_rows.append([frame_idx, current_timestamp, tracker_id_tensor.item(), class_name, confidence_tensor.item(), x_min, y_min, x_max, y_max]) # Added current_timestamp
             elif detections.class_id is not None and detections.confidence is not None: # Ensure other necessary fields are present
                 labels = [
                     f"{id2label[class_id]} ({confidence:.2f})"
                     for class_id, confidence in zip(detections.class_id, detections.confidence)
                 ]
-            # If even class_id or confidence is None, labels will remain empty, which is a safe fallback.
+                if create_dataset: # Also log to dataset if no tracker_id but detections exist
+                    for box, class_id_tensor, confidence_tensor in zip(detections.xyxy, detections.class_id, detections.confidence):
+                        class_name = id2label[class_id_tensor.item()]
+                        x_min, y_min, x_max, y_max = box.tolist()
+                        dataset_rows.append([frame_idx, current_timestamp, -1, class_name, confidence_tensor.item(), x_min, y_min, x_max, y_max]) # Added current_timestamp
 
             annotated_frame = box_annotator.annotate(scene=frame, detections=detections)
             annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
@@ -188,13 +203,20 @@ def process_video(
                 annotated_frame = trace_annotator.annotate(scene=annotated_frame, detections=detections)
             annotated_frames.append(annotated_frame)
     else:
-        for frame, result in tqdm.tqdm(zip(frames, results), desc="Annotating frames", total=len(frames)):
+        for frame_idx, (frame, result) in enumerate(progress.tqdm(zip(frames, results), desc="Annotating frames", total=len(frames))): # Added frame_idx
+            current_timestamp = frame_idx / actual_processing_fps if actual_processing_fps > 0 else 0.0 # Calculate timestamp
             detections = sv.Detections.from_transformers(result, id2label=id2label)
             detections = detections.with_nms(threshold=0.95, class_agnostic=True)
             labels = [
                 f"{id2label[class_id]} ({confidence:.2f})"
                 for class_id, confidence in zip(detections.class_id, detections.confidence)
             ]
+            if create_dataset:
+                for box, class_id_tensor, confidence_tensor in zip(detections.xyxy, detections.class_id, detections.confidence):
+                    class_name = id2label[class_id_tensor.item()]
+                    x_min, y_min, x_max, y_max = box.tolist()
+                    dataset_rows.append([frame_idx, current_timestamp, -1, class_name, confidence_tensor.item(), x_min, y_min, x_max, y_max]) # Added current_timestamp
+            
             annotated_frame = box_annotator.annotate(scene=frame, detections=detections)
             annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
             annotated_frames.append(annotated_frame)
@@ -202,4 +224,14 @@ def process_video(
     base, ext = os.path.splitext(os.path.basename(video_path))
     output_filename = os.path.join(VIDEO_OUTPUT_DIR, f"{base}_processed.mp4")
     iio.imwrite(output_filename, annotated_frames, fps=video_fps, codec="h264") # Use user-selected video_fps for output file
+
+    if create_dataset and dataset_rows:
+        dataset_filename = DATASET_OUTPUT_DIR / f"{base}_dataset.csv"
+        headers = ["frame_index", "timestamp_seconds", "tracker_id", "class_name", "confidence", "x_min", "y_min", "x_max", "y_max"] # Added timestamp_seconds to headers
+        with open(dataset_filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            writer.writerows(dataset_rows)
+        logger.info(f"Dataset saved to {dataset_filename}")
+
     return output_filename 

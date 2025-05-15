@@ -10,3 +10,5 @@ supervision
 trackers[deepsort] @ git+https://github.com/roboflow/trackers
 spaces
 imageio[pyav]
+plotly
+pandas
